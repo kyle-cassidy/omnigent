@@ -190,6 +190,12 @@ databricks = [
     # Databricks-specific MCP servers. Not imported by core Omnigent
     # code, so it is opt-in here rather than a default dependency.
     "databricks-mcp>=0.1.0",
+    # Floor the transitive databricks-ai-bridge: older releases pull a
+    # databricks-vectorsearch that pins protobuf 5.x (conflicts with our
+    # protobuf>=6), so the resolver backtracks to an ai-bridge that caps
+    # mlflow at 3.2 and pyarrow<22 — and pyarrow 21 has no cp314 wheel, so a
+    # fresh install on Python 3.14 tries (and fails) to build it from source.
+    "databricks-ai-bridge>=0.19",
 ]
 dev = [
     "pytest>=7.0",
