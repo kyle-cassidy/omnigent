@@ -732,6 +732,56 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
         if dest_path.exists() or dest_path.is_symlink():
             continue
         shutil.copy2(source_file, dest_path)
+        if filename == "config.toml":
+            _rekey_copied_hook_trust(dest_path, source_file)
+
+
+def _rekey_copied_hook_trust(dest_path: Path, source_path: Path) -> None:
+    """
+    Carry the user's hook-trust decisions across the config.toml copy.
+
+    Codex keys hook trust by the *absolute path* of the file declaring the
+    hook (``hooks.state."<file>:<event>:<i>:<j>"``). Copying the user's
+    ``config.toml`` into the private ``CODEX_HOME`` moves its hooks to a
+    new path, so their recorded trust no longer matches and codex treats
+    them as new. A TUI then opens its blocking "Hooks need review" dialog
+    at startup and creates no thread until someone answers it — which on a
+    host-spawned session nobody can, so the session hangs with
+    "Codex app-server never started a thread".
+
+    Only entries the user already recorded are rewritten, and only for
+    keys belonging to the file just copied: an untrusted hook stays
+    untrusted, and hooks declared elsewhere (a project ``.codex``, a
+    plugin) keep their own still-valid keys.
+
+    :param dest_path: The private copy, e.g.
+        ``Path("/…/codex-home/config.toml")``.
+    :param source_path: The user's original, e.g.
+        ``Path("~/.codex/config.toml")``.
+    :returns: None.
+    """
+    old_prefix = f'"{source_path}:'
+    new_prefix = f'"{dest_path}:'
+    try:
+        text = dest_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return  # best-effort; a re-prompt is better than a failed launch
+    if old_prefix not in text:
+        return
+    lines = text.splitlines(keepends=True)
+    in_hook_state = False
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("["):
+            # Rewrite `[hooks.state."<old>:…"]` headers, and track whether
+            # following bare keys belong to a `[hooks.state]` table.
+            in_hook_state = stripped.startswith("[hooks.state]")
+            if stripped.startswith("[hooks.state.") and old_prefix in line:
+                lines[i] = line.replace(old_prefix, new_prefix, 1)
+            continue
+        if in_hook_state and old_prefix in line:
+            lines[i] = line.replace(old_prefix, new_prefix, 1)
+    dest_path.write_text("".join(lines), encoding="utf-8")
 
 
 def _databricks_codex_base_url(host: str) -> str:

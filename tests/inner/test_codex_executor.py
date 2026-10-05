@@ -5,6 +5,7 @@ import base64
 import contextlib
 import json
 import tempfile
+import tomllib
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -2209,6 +2210,151 @@ def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
     _populate_codex_home_config(target, source)
 
     assert list(target.iterdir()) == []
+
+
+def test_populate_codex_home_config_carries_hook_trust_to_the_copy(tmp_path: Path) -> None:
+    """Hook trust recorded for the user's config follows it into the copy.
+
+    Codex keys hook trust by the declaring file's absolute path. Copying
+    ``config.toml`` into the private ``CODEX_HOME`` moved its hooks to a new
+    path, so codex saw them as new and the TUI opened its blocking "Hooks
+    need review" dialog at startup — no thread was ever created and the
+    session died with "Codex app-server never started a thread".
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_config = source / "config.toml"
+    source_config.write_text(
+        "[[hooks.UserPromptSubmit]]\n"
+        'hooks = [{ type = "command", command = "bun inbox-hook.ts context" }]\n'
+        "\n"
+        f'[hooks.state."{source_config}:user_prompt_submit:0:0"]\n'
+        'trusted_hash = "sha256:aaa"\n'
+        "\n"
+        f'[hooks.state."{source_config}:stop:0:0"]\n'
+        'trusted_hash = "sha256:bbb"\n',
+        encoding="utf-8",
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    state = tomllib.loads((target / "config.toml").read_text(encoding="utf-8"))["hooks"]["state"]
+    target_config = target / "config.toml"
+    assert state[f"{target_config}:user_prompt_submit:0:0"]["trusted_hash"] == "sha256:aaa"
+    assert state[f"{target_config}:stop:0:0"]["trusted_hash"] == "sha256:bbb"
+    # The old keys must not linger: codex would treat them as stale entries
+    # for a file this home does not have.
+    assert not any(str(source_config) in key for key in state)
+
+
+def test_populate_codex_home_config_leaves_other_hook_owners_alone(tmp_path: Path) -> None:
+    """Only keys for the copied file are rewritten.
+
+    A project-level ``.codex/config.toml`` and a plugin keep their own paths,
+    which are still valid inside the private home, so their trust entries
+    must survive untouched.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_config = source / "config.toml"
+    project_config = "/repo/.codex/config.toml"
+    source_config.write_text(
+        f'[hooks.state."{source_config}:stop:0:0"]\n'
+        'trusted_hash = "sha256:mine"\n'
+        "\n"
+        f'[hooks.state."{project_config}:session_start:0:0"]\n'
+        'trusted_hash = "sha256:project"\n',
+        encoding="utf-8",
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    state = tomllib.loads((target / "config.toml").read_text(encoding="utf-8"))["hooks"]["state"]
+    assert state[f"{project_config}:session_start:0:0"]["trusted_hash"] == "sha256:project"
+    assert state[f"{target / 'config.toml'}:stop:0:0"]["trusted_hash"] == "sha256:mine"
+
+
+def test_populate_codex_home_config_does_not_invent_hook_trust(tmp_path: Path) -> None:
+    """A hook the user never trusted gains no trust from being copied.
+
+    The rekey carries existing decisions across a path change; it must never
+    create one, or Omnigent would be silently trusting a hook codex asked
+    about and the user declined.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        "[[hooks.Stop]]\n"
+        'hooks = [{ type = "command", command = "bun inbox-hook.ts stop" }]\n',
+        encoding="utf-8",
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    parsed = tomllib.loads((target / "config.toml").read_text(encoding="utf-8"))
+    assert "state" not in parsed.get("hooks", {})
+
+
+def test_populate_codex_home_config_rekey_keeps_the_source_untouched(tmp_path: Path) -> None:
+    """The user's shared ``~/.codex/config.toml`` is never rewritten."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_config = source / "config.toml"
+    original = f'[hooks.state."{source_config}:stop:0:0"]\ntrusted_hash = "sha256:x"\n'
+    source_config.write_text(original, encoding="utf-8")
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert source_config.read_text(encoding="utf-8") == original
+
+
+def test_populate_codex_home_config_rekeys_inline_hook_state_table(tmp_path: Path) -> None:
+    """Trust written as keys under a bare ``[hooks.state]`` table is rekeyed too.
+
+    Codex writes one sub-table per hook, but a hand-edited config may use the
+    flat form; both are the same table.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_config = source / "config.toml"
+    source_config.write_text(
+        "[hooks.state]\n"
+        f'"{source_config}:stop:0:0" = {{ trusted_hash = "sha256:flat" }}\n'
+        "\n"
+        "[memories]\n"
+        f'note = "{source_config}:not-a-hook-key"\n',
+        encoding="utf-8",
+    )
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    parsed = tomllib.loads((target / "config.toml").read_text(encoding="utf-8"))
+    assert parsed["hooks"]["state"][f"{target / 'config.toml'}:stop:0:0"] == {
+        "trusted_hash": "sha256:flat"
+    }
+    # A value outside [hooks.state] that happens to mention the old path is
+    # not a hook key and must not be rewritten.
+    assert parsed["memories"]["note"] == f"{source_config}:not-a-hook-key"
 
 
 def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
