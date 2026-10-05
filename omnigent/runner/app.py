@@ -3909,11 +3909,14 @@ async def _codex_discover_thread_and_forward(
         TUI's ``thread/started``; reused to subscribe the forwarder.
     """
     from omnigent.codex_native_bridge import (
+        CODEX_THREAD_START_PENDING_MESSAGE,
         CodexNativeBridgeState,
+        clear_bridge_startup_error,
         write_bridge_startup_error,
         write_bridge_state,
     )
     from omnigent.codex_native_forwarder import (
+        THREAD_START_GRACE_SECONDS,
         supervise_forwarder,
         wait_for_thread_started,
     )
@@ -3922,32 +3925,57 @@ async def _codex_discover_thread_and_forward(
         _RunnerDatabricksAuth,
     )
 
+    def _record_startup_failure(exc: BaseException) -> None:
+        """Leave the real cause for the executor to report (#59)."""
+        _logger.exception(
+            "Codex TUI never started a thread for %s; chat will not forward",
+            session_id,
+        )
+        # Bridge state is never written here; leave the real cause for the executor (#59).
+        cause = (
+            "startup timed out"
+            if isinstance(exc, TimeoutError)
+            else "event stream ended before a thread was created"
+        )
+        write_bridge_startup_error(
+            bridge_dir,
+            f"Codex app-server never started a thread ({cause}: "
+            f"{type(exc).__name__}). See the runner log near 'native-codex "
+            "routing' for the resolved provider/model.",
+        )
+
     try:
         try:
             thread_id = await wait_for_thread_started(event_client)
-        except (TimeoutError, RuntimeError) as exc:
-            # Expected failure modes of wait_for_thread_started: the TUI exited
-            # at startup, or the event stream ended before a thread was
-            # created. Stop forwarding (cleanup runs in ``finally``); any other
-            # error is a bug and propagates.
-            _logger.exception(
-                "Codex TUI never started a thread for %s; chat will not forward",
+        except TimeoutError:
+            # The TUI is alive but has published no thread yet — nearly
+            # always a startup dialog waiting on a keypress nobody made.
+            # Record that so a turn sent meanwhile says so, then keep
+            # listening: answering the prompt in the Terminal tab has to
+            # recover the session without recreating it.
+            _logger.warning(
+                "Codex TUI has not started a thread for %s yet; still listening "
+                "(a startup prompt in its terminal pane is the usual cause)",
                 session_id,
             )
-            # Bridge state is never written here; leave the real cause for the executor (#59).
-            cause = (
-                "startup timed out"
-                if isinstance(exc, TimeoutError)
-                else "event stream ended before a thread was created"
-            )
-            write_bridge_startup_error(
-                bridge_dir,
-                f"Codex app-server never started a thread ({cause}: "
-                f"{type(exc).__name__}). See the runner log near 'native-codex "
-                "routing' for the resolved provider/model.",
-            )
+            write_bridge_startup_error(bridge_dir, CODEX_THREAD_START_PENDING_MESSAGE)
+            try:
+                thread_id = await wait_for_thread_started(
+                    event_client, timeout=THREAD_START_GRACE_SECONDS
+                )
+            except (TimeoutError, RuntimeError) as exc:
+                # Expected failure modes of wait_for_thread_started: the TUI
+                # exited at startup, or the event stream ended before a thread
+                # was created. Stop forwarding (cleanup runs in ``finally``);
+                # any other error is a bug and propagates.
+                _record_startup_failure(exc)
+                return
+        except RuntimeError as exc:
+            _record_startup_failure(exc)
             return
 
+        # The thread exists, so any pending-prompt record above is stale.
+        clear_bridge_startup_error(bridge_dir)
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(

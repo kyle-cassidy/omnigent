@@ -65,6 +65,13 @@ _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
 # app-server thread (emit ``thread/started``) before giving up. Generous
 # because a host-spawned TUI cold-starts over the runner.
 _THREAD_START_TIMEOUT_SECONDS = 30.0
+# Second, much longer window entered after the first one lapses. A TUI that
+# has not created a thread by then is typically parked on a startup dialog
+# (directory trust, sign-in, an update notice) that only a keypress in the
+# terminal pane clears, so the wait continues rather than killing the
+# session. Matched to the native pane reaper's idle timeout: past that the
+# pane itself is gone and there is nothing left to wait for.
+THREAD_START_GRACE_SECONDS = 1800.0
 _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
 # A freshly created thread passes through a second transient state: its rollout
 # file exists but is still empty (the TUI created the thread but no turn has

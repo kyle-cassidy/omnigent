@@ -26,6 +26,16 @@ _STARTUP_ERROR_FILE = "startup_error.json"
 # Stop handler.
 _MCP_STARTUP_FILE = "mcp_startup.json"
 
+# Recorded as the startup error while the runner is still waiting on a
+# thread that a launched TUI has not created yet — the pane is parked on a
+# startup dialog only a keypress clears. Distinguished from a terminal
+# failure so the executor keeps waiting instead of failing the turn.
+CODEX_THREAD_START_PENDING_MESSAGE = (
+    "Codex has not started a thread yet. Its terminal pane is most likely waiting on a "
+    "startup prompt — directory trust, sign-in, or an update notice. Open the Terminal "
+    "tab and answer it; the session picks up automatically once the thread starts."
+)
+
 # Startup states mirrored from Codex's ``McpServerStartupState`` enum.
 MCP_STARTUP_STARTING = "starting"
 MCP_STARTUP_READY = "ready"
@@ -385,6 +395,25 @@ def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
                 os.unlink(tmp_name)
     except OSError:
         return  # best-effort; the real failure is already logged
+
+
+def clear_bridge_startup_error(bridge_dir: Path) -> None:
+    """
+    Drop a recorded startup failure once the thread does start.
+
+    The startup error is what the executor reports instead of running a
+    turn, and what stops its bridge-state wait early. A thread that
+    starts late — the TUI was sitting on a prompt until someone answered
+    it in the terminal pane — makes that record stale, so it is removed
+    rather than left to fail every later turn.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: None.
+    """
+    try:
+        (bridge_dir / _STARTUP_ERROR_FILE).unlink()
+    except (FileNotFoundError, OSError):
+        return  # best-effort; a stale record only degrades messaging
 
 
 def read_bridge_startup_error(bridge_dir: Path) -> str | None:

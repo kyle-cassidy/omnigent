@@ -4209,6 +4209,84 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 
 
 @pytest.mark.asyncio
+async def test_codex_discover_thread_and_forward_recovers_from_a_late_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A TUI parked on a startup dialog must not kill the session.
+
+    The first wait lapses while the pane sits on codex's directory-trust /
+    sign-in prompt. That records a pending breadcrumb (so a turn sent
+    meanwhile explains the stall) but keeps listening; once someone answers
+    the prompt the thread starts, the breadcrumb is dropped, and forwarding
+    proceeds as normal.
+    """
+    from omnigent import codex_native_forwarder
+    from omnigent.codex_native_bridge import (
+        CODEX_THREAD_START_PENDING_MESSAGE,
+        read_bridge_startup_error,
+        read_bridge_state,
+    )
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    recorded_while_waiting: list[str | None] = []
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    calls = {"n": 0}
+
+    async def _late_thread(*_args: object, **_kwargs: object) -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("no thread/started observed")
+        # Second call = the grace window; snapshot what a turn would read.
+        recorded_while_waiting.append(read_bridge_startup_error(tmp_path))
+        return "019e8720-98d7-7b23-ac0a-bfb0eb02e0c9"
+
+    forwarder_kwargs: dict[str, Any] = {}
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        forwarder_kwargs.update(kwargs)
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _late_thread)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _no_op_forwarder)
+
+    session_id = "conv_codex_late_thread_test"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            event_client=_Client(),  # type: ignore[arg-type]
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    # It kept listening rather than giving up after the first window.
+    assert calls["n"] == 2
+    # While waiting, a turn would have been told what to do about it.
+    assert recorded_while_waiting == [CODEX_THREAD_START_PENDING_MESSAGE]
+    # The thread exists now, so the breadcrumb must not outlive it.
+    assert read_bridge_startup_error(tmp_path) is None
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == "019e8720-98d7-7b23-ac0a-bfb0eb02e0c9"
+    assert forwarder_kwargs["thread_id"] == "019e8720-98d7-7b23-ac0a-bfb0eb02e0c9"
+
+
+@pytest.mark.asyncio
 async def test_create_session() -> None:
     """``POST /v1/sessions`` spawns harness and returns SessionResponse shape."""
     app, pm, _hc = _build_lifecycle_app()

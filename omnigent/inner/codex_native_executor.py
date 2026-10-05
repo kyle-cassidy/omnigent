@@ -15,6 +15,7 @@ from omnigent.codex_native_app_server import client_for_transport
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    CODEX_THREAD_START_PENDING_MESSAGE,
     cancel_pending_mcp_startup,
     mcp_startup_waiting_detail,
     read_bridge_startup_error,
@@ -214,8 +215,12 @@ class CodexNativeExecutor(Executor):
         state = read_bridge_state(self._bridge_dir)
         if state is None:
             for _ in range(60):
-                # Startup already failed; the runner recorded the cause — stop waiting.
-                if read_bridge_startup_error(self._bridge_dir) is not None:
+                # Startup already failed; the runner recorded the cause — stop
+                # waiting. The pending-prompt record is not such a cause: the
+                # runner is still listening and the pane may be answered while
+                # this wait runs, so keep polling for the thread.
+                recorded = read_bridge_startup_error(self._bridge_dir)
+                if recorded is not None and recorded != CODEX_THREAD_START_PENDING_MESSAGE:
                     break
                 await asyncio.sleep(1.0)
                 state = read_bridge_state(self._bridge_dir)
@@ -236,11 +241,14 @@ class CodexNativeExecutor(Executor):
             state = read_bridge_state(self._bridge_dir)
             if state is None:
                 startup_error = read_bridge_startup_error(self._bridge_dir)
-                error_msg = (
-                    f"Codex native thread never started: {startup_error}"
-                    if startup_error
-                    else "Codex native bridge state is missing"
-                )
+                if startup_error == CODEX_THREAD_START_PENDING_MESSAGE:
+                    # Already a complete, actionable sentence — prefixing it
+                    # with a failure phrase would only bury the instruction.
+                    error_msg = startup_error
+                elif startup_error:
+                    error_msg = f"Codex native thread never started: {startup_error}"
+                else:
+                    error_msg = "Codex native bridge state is missing"
             elif not _session_is_active(state.session_id, self._request_session_id):
                 error_msg = "Codex native session is no longer active"
             else:
